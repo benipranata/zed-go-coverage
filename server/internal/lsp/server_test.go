@@ -536,3 +536,225 @@ func TestLogLoadErrorWriteFailure(t *testing.T) {
 		t.Fatal("expected write error")
 	}
 }
+
+func tokensReq(uri string) string {
+	return frame("textDocument/semanticTokens/full", 5, map[string]any{"textDocument": map[string]any{"uri": uri}})
+}
+
+func tokenData(t *testing.T, msgs []map[string]any) string {
+	t.Helper()
+	for _, m := range msgs {
+		if m["id"] == float64(5) {
+			return fmt.Sprint(m["result"].(map[string]any)["data"])
+		}
+	}
+	t.Fatalf("no token response in %v", msgs)
+	return ""
+}
+
+func TestSemanticTokens(t *testing.T) {
+	const profile = `mode: set
+example.com/m/pkg/a.go:1.1,1.3 1 1
+example.com/m/pkg/a.go:2.2,4.3 1 0
+example.com/m/pkg/a.go:9.1,9.2 1 0
+`
+	tests := []struct {
+		name  string
+		text  string
+		extra func(uri string) []string
+		want  string
+	}{
+		{
+			name: "covered and multi-line uncovered blocks",
+			text: "ab\n\tcd\n\n\tef\n",
+			// covered 1:1-3; uncovered 2:2-end, 4:1-3; the empty line 3 and the
+			// out-of-range block at line 9 produce nothing.
+			want: "[0 0 2 0 0 1 1 2 1 0 2 0 2 1 0]",
+		},
+		{
+			name: "dirty document is empty",
+			text: "ab\n\tcd\n\n\tef\n",
+			extra: func(uri string) []string {
+				return []string{frame("textDocument/didChange", nil, map[string]any{
+					"textDocument":   map[string]any{"uri": uri},
+					"contentChanges": []any{map[string]any{"text": "ab\n"}},
+				})}
+			},
+			want: "[]",
+		},
+		{
+			name: "unknown document is empty",
+			text: "ab\n",
+			extra: func(uri string) []string {
+				return []string{docMsg("textDocument/didClose", uri)}
+			},
+			want: "[]",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newProject(t)
+			write(t, p.profile, profile)
+			uri := fileURI(p.file)
+			script := append(initMsgs(p, nil), openMsg(p, tc.text))
+			if tc.extra != nil {
+				script = append(script, tc.extra(uri)...)
+			}
+			script = append(script, tokensReq(uri), frame("exit", nil, nil))
+			got := tokenData(t, runScript(t, script...))
+			if got != tc.want {
+				t.Fatalf("got %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSemanticTokensOutsideModule(t *testing.T) {
+	p := newProject(t)
+	uri := fileURI(filepath.Join(t.TempDir(), "x.go"))
+	msgs := runScript(t, append(initMsgs(p, nil),
+		frame("textDocument/didOpen", nil, map[string]any{
+			"textDocument": map[string]any{"uri": uri, "text": "ab\n"},
+		}),
+		tokensReq(uri), frame("exit", nil, nil))...)
+	if got := tokenData(t, msgs); got != "[]" {
+		t.Fatalf("got %s", got)
+	}
+}
+
+const clientResponseBody = `{"jsonrpc":"2.0","id":"x","result":null}`
+
+var clientResponse = fmt.Sprintf("Content-Length: %d\r\n\r\n%s", len(clientResponseBody), clientResponseBody)
+
+func TestDiagnosticsOptionAndRefresh(t *testing.T) {
+	tests := []struct {
+		name        string
+		opts        any
+		refreshCap  bool
+		wantDiags   int
+		wantRefresh int
+	}{
+		{"defaults", nil, false, 2, 0},
+		{"diagnostics off", map[string]any{"diagnostics": false}, false, 0, 0},
+		{"refresh supported", map[string]any{"diagnostics": false}, true, 0, 2},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newProject(t)
+			write(t, p.profile, "mode: set\nexample.com/m/pkg/a.go:1.1,1.3 1 0\n")
+			caps := map[string]any{}
+			if tc.refreshCap {
+				caps["workspace"] = map[string]any{"semanticTokens": map[string]any{"refreshSupport": true}}
+			}
+			msgs := runScript(t,
+				frame("initialize", 1, map[string]any{
+					"rootUri": fileURI(p.root), "initializationOptions": tc.opts, "capabilities": caps,
+				}),
+				frame("initialized", nil, map[string]any{}),
+				openMsg(p, "ab\n"),
+				// A client response to our refresh request must be ignored.
+				clientResponse,
+				docMsg("textDocument/didSave", fileURI(p.file)),
+				frame("exit", nil, nil),
+			)
+			var diags, refresh int
+			for _, m := range msgs {
+				switch m["method"] {
+				case "textDocument/publishDiagnostics":
+					if len(diagnosticsOf(m)) > 0 {
+						diags++
+					}
+				case "workspace/semanticTokens/refresh":
+					refresh++
+				}
+				if _, isErr := m["error"]; isErr {
+					t.Fatalf("unexpected error response: %v", m)
+				}
+			}
+			if diags != tc.wantDiags {
+				t.Fatalf("diagnostics = %d, want %d", diags, tc.wantDiags)
+			}
+			if refresh != tc.wantRefresh {
+				t.Fatalf("refresh = %d, want %d", refresh, tc.wantRefresh)
+			}
+		})
+	}
+}
+
+func TestPublishRefreshWriteFailure(t *testing.T) {
+	s := New(strings.NewReader(""), failWriter{}, time.Hour)
+	s.canRefresh = true
+	if err := s.publish("file:///x.go"); err == nil {
+		t.Fatal("expected write error")
+	}
+}
+
+func TestDocumentColors(t *testing.T) {
+	const profile = `mode: set
+example.com/m/pkg/a.go:1.1,1.3 1 1
+example.com/m/pkg/a.go:2.2,2.4 1 0
+`
+	tests := []struct {
+		name string
+		text string
+		want []float64 // red of each returned color
+	}{
+		{"covered then uncovered", "ab\n\tcd\n", []float64{coveredColor.Red, uncoveredColor.Red}},
+		{"no blocks in range", "", nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newProject(t)
+			write(t, p.profile, profile)
+			uri := fileURI(p.file)
+			msgs := runScript(t, append(initMsgs(p, nil), openMsg(p, tc.text),
+				frame("textDocument/documentColor", 5, map[string]any{"textDocument": map[string]any{"uri": uri}}),
+				frame("exit", nil, nil))...)
+			var got []float64
+			for _, m := range msgs {
+				if m["id"] != float64(5) {
+					continue
+				}
+				for _, c := range m["result"].([]any) {
+					got = append(got, c.(map[string]any)["color"].(map[string]any)["red"].(float64))
+				}
+			}
+			if fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestShowOption(t *testing.T) {
+	tests := []struct {
+		name string
+		opts any
+		want int
+	}{
+		{"default shows both", nil, 2},
+		{"all", map[string]any{"show": "all"}, 2},
+		{"uncovered only", map[string]any{"show": "uncovered"}, 1},
+		{"covered only", map[string]any{"show": "covered"}, 1},
+		{"unknown falls back to all", map[string]any{"show": "bogus"}, 2},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newProject(t)
+			write(t, p.profile, "mode: set\nexample.com/m/pkg/a.go:1.1,1.3 1 1\nexample.com/m/pkg/a.go:2.2,2.4 1 0\n")
+			uri := fileURI(p.file)
+			msgs := runScript(t, append(initMsgs(p, tc.opts), openMsg(p, "ab\n\tcd\n"),
+				frame("textDocument/documentColor", 5, map[string]any{"textDocument": map[string]any{"uri": uri}}),
+				frame("exit", nil, nil))...)
+			for _, m := range msgs {
+				if m["id"] == float64(5) {
+					if n := len(m["result"].([]any)); n != tc.want {
+						t.Fatalf("got %d colors, want %d", n, tc.want)
+					}
+					return
+				}
+			}
+			t.Fatal("no documentColor response")
+		})
+	}
+}

@@ -21,6 +21,12 @@ import (
 
 const defaultProfile = "coverage.out"
 
+const (
+	showAll       = "all"
+	showCovered   = "covered"
+	showUncovered = "uncovered"
+)
+
 type Server struct {
 	in       *bufio.Reader
 	out      io.Writer
@@ -34,6 +40,11 @@ type Server struct {
 	docs        map[string]string
 	dirty       map[string]bool
 	loadErr     string
+
+	diagnostics bool
+	show        string
+	canRefresh  bool
+	nextID      int
 }
 
 func New(in io.Reader, out io.Writer, pollInterval time.Duration) *Server {
@@ -43,6 +54,9 @@ func New(in io.Reader, out io.Writer, pollInterval time.Duration) *Server {
 		interval: pollInterval,
 		docs:     map[string]string{},
 		dirty:    map[string]bool{},
+
+		diagnostics: true,
+		show:        showAll,
 	}
 }
 
@@ -93,6 +107,11 @@ type diagnostic struct {
 }
 
 const severityInformation = 3
+
+// Custom semantic token types, styled by the client with background colors.
+var tokenTypes = []string{"coverageCovered", "coverageUncovered"}
+
+type token struct{ line, col, length, typ int }
 
 // Run serves requests until an exit notification or the end of input.
 func (s *Server) Run() error {
@@ -165,6 +184,11 @@ func (s *Server) handle(msg message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Responses to our own requests carry no method.
+	if msg.Method == "" {
+		return nil
+	}
+
 	switch msg.Method {
 	case "initialize":
 		return s.initialize(msg)
@@ -201,6 +225,22 @@ func (s *Server) handle(msg message) error {
 		s.docs[p.TextDocument.URI] = p.ContentChanges[len(p.ContentChanges)-1].Text
 		s.dirty[p.TextDocument.URI] = true
 		return s.sendDiagnostics(p.TextDocument.URI, nil)
+	case "textDocument/documentColor":
+		var p struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+		}
+		_ = json.Unmarshal(msg.Params, &p)
+		return s.reply(msg.ID, s.documentColors(p.TextDocument.URI))
+	case "textDocument/semanticTokens/full":
+		var p struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+		}
+		_ = json.Unmarshal(msg.Params, &p)
+		return s.reply(msg.ID, map[string]any{"data": s.semanticTokens(p.TextDocument.URI)})
 	case "textDocument/didSave":
 		return s.withURI(msg, func(uri string) error {
 			delete(s.dirty, uri)
@@ -237,12 +277,21 @@ func (s *Server) withURI(msg message, fn func(uri string) error) error {
 
 func (s *Server) initialize(msg message) error {
 	var p struct {
+		Capabilities struct {
+			Workspace struct {
+				SemanticTokens struct {
+					RefreshSupport bool `json:"refreshSupport"`
+				} `json:"semanticTokens"`
+			} `json:"workspace"`
+		} `json:"capabilities"`
 		RootURI          string `json:"rootUri"`
 		WorkspaceFolders []struct {
 			URI string `json:"uri"`
 		} `json:"workspaceFolders"`
 		InitOption struct {
-			Profile string `json:"profile"`
+			Profile     string `json:"profile"`
+			Diagnostics *bool  `json:"diagnostics"`
+			Show        string `json:"show"`
 		} `json:"initializationOptions"`
 	}
 	_ = json.Unmarshal(msg.Params, &p)
@@ -259,10 +308,22 @@ func (s *Server) initialize(msg message) error {
 		profile = filepath.Join(s.root, profile)
 	}
 	s.profilePath = profile
+	s.canRefresh = p.Capabilities.Workspace.SemanticTokens.RefreshSupport
+	if p.InitOption.Show == showCovered || p.InitOption.Show == showUncovered {
+		s.show = p.InitOption.Show
+	}
+	if p.InitOption.Diagnostics != nil {
+		s.diagnostics = *p.InitOption.Diagnostics
+	}
 
 	return s.reply(msg.ID, map[string]any{
 		"capabilities": map[string]any{
 			"textDocumentSync": map[string]any{"openClose": true, "change": 1, "save": map[string]any{}},
+			"colorProvider":    true,
+			"semanticTokensProvider": map[string]any{
+				"legend": map[string]any{"tokenTypes": tokenTypes, "tokenModifiers": []string{}},
+				"full":   true,
+			},
 		},
 		"serverInfo": map[string]any{"name": "go-coverage-lsp"},
 	})
@@ -341,7 +402,27 @@ func (s *Server) logLoadError(err error) error {
 }
 
 func (s *Server) publish(uri string) error {
-	return s.sendDiagnostics(uri, s.diagnostics(uri))
+	if err := s.refreshTokens(); err != nil {
+		return err
+	}
+	if !s.diagnostics {
+		return nil
+	}
+	return s.sendDiagnostics(uri, s.diagnosticsFor(uri))
+}
+
+// refreshTokens asks the client to re-request semantic tokens, which it only
+// does on its own after edits.
+func (s *Server) refreshTokens() error {
+	if !s.canRefresh {
+		return nil
+	}
+	s.nextID++
+	return s.write(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      fmt.Sprintf("refresh-%d", s.nextID),
+		"method":  "workspace/semanticTokens/refresh",
+	})
 }
 
 func (s *Server) sendDiagnostics(uri string, diags []diagnostic) error {
@@ -355,7 +436,7 @@ func (s *Server) sendDiagnostics(uri string, diags []diagnostic) error {
 	})
 }
 
-func (s *Server) diagnostics(uri string) []diagnostic {
+func (s *Server) diagnosticsFor(uri string) []diagnostic {
 	file := uriToPath(uri)
 	importPath, ok := importPathFor(file)
 	if !ok {
@@ -435,4 +516,101 @@ func modulePath(goMod string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// semanticTokens returns the LSP-encoded coverage tokens for a saved document.
+func (s *Server) semanticTokens(uri string) []int {
+	data := []int{}
+	prevLine, prevCol := 0, 0
+	for _, t := range s.coverageTokens(uri) {
+		if t.line != prevLine {
+			prevCol = 0
+		}
+		data = append(data, t.line-prevLine, t.col-prevCol, t.length, t.typ, 0)
+		prevLine, prevCol = t.line, t.col
+	}
+	return data
+}
+
+type color struct {
+	Red   float64 `json:"red"`
+	Green float64 `json:"green"`
+	Blue  float64 `json:"blue"`
+	Alpha float64 `json:"alpha"`
+}
+
+type colorInformation struct {
+	Range lspRange `json:"range"`
+	Color color    `json:"color"`
+}
+
+// Translucent so the code stays readable on either theme.
+var (
+	coveredColor   = color{0.18, 0.63, 0.26, 0.2}
+	uncoveredColor = color{0.97, 0.32, 0.29, 0.2}
+)
+
+// documentColors reports the coverage spans as colors, which clients can
+// render as a background behind the text.
+func (s *Server) documentColors(uri string) []colorInformation {
+	out := []colorInformation{}
+	for _, t := range s.coverageTokens(uri) {
+		c := coveredColor
+		if t.typ == 1 {
+			c = uncoveredColor
+		}
+		out = append(out, colorInformation{
+			Range: lspRange{
+				Start: position{t.line, t.col},
+				End:   position{t.line, t.col + t.length},
+			},
+			Color: c,
+		})
+	}
+	return out
+}
+
+// coverageTokens returns the single-line covered/uncovered spans of a saved
+// document, in document order. Multi-line blocks are split per line because
+// clients may not support spans across lines.
+func (s *Server) coverageTokens(uri string) []token {
+	if s.dirty[uri] {
+		return nil
+	}
+	importPath, ok := importPathFor(uriToPath(uri))
+	if !ok {
+		return nil
+	}
+	text, ok := s.docs[uri]
+	if !ok {
+		return nil
+	}
+	lines := strings.Split(text, "\n")
+	var tokens []token
+	for _, b := range s.profile[importPath] {
+		if b.StartLine < 1 || b.EndLine < b.StartLine || b.EndLine > len(lines) {
+			continue
+		}
+		typ := 0
+		if b.Count == 0 {
+			typ = 1
+		}
+		if (typ == 0 && s.show == showUncovered) || (typ == 1 && s.show == showCovered) {
+			continue
+		}
+		for n := b.StartLine; n <= b.EndLine; n++ {
+			line := lines[n-1]
+			start, end := 0, utf16Col(line, len(line))
+			if n == b.StartLine {
+				start = utf16Col(line, b.StartCol-1)
+			}
+			if n == b.EndLine {
+				end = utf16Col(line, b.EndCol-1)
+			}
+			if end > start {
+				tokens = append(tokens, token{n - 1, start, end - start, typ})
+			}
+		}
+	}
+	return tokens
 }

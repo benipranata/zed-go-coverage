@@ -27,17 +27,77 @@ them. If the profile cannot be read or parsed, the server logs the error once.
 
 ## Configuration
 
-The server reads `coverage.out` in the project root by default. If you write the
-profile elsewhere, for example with `go test -coverprofile=out/cover.out ./...`,
-set its path (relative to the project root or absolute):
+All options go under `lsp.go-coverage.initialization_options` in your Zed
+settings. They are optional.
+
+| Option        | Values                                    | Default         | Effect                                                              |
+| ------------- | ----------------------------------------- | --------------- | ------------------------------------------------------------------- |
+| `profile`     | path, relative to the project root or absolute | `coverage.out` | Coverage profile to read.                                           |
+| `show`        | `"all"`, `"uncovered"`, `"covered"`       | `"all"`         | Which blocks to mark. Unknown values fall back to `"all"`.          |
+| `diagnostics` | `true`, `false`                           | `true`          | Also report uncovered blocks as diagnostics (the underline).        |
+
+Zed settings that affect how coverage is drawn:
+
+| Setting                                  | Values                                              | Effect                                                            |
+| ---------------------------------------- | --------------------------------------------------- | ----------------------------------------------------------------- |
+| `lsp_document_colors`                    | `"background"`, `"border"`, `"inlay"`, `"none"`     | How Zed draws the colors this server reports. Also affects other servers that report colors. |
+| `languages.Go.semantic_tokens`           | `"combined"`, `"full"`, `"off"`                     | Needed only for the semantic-token route below.                   |
+| `global_lsp_settings.semantic_token_rules` | rules for `coverageCovered` / `coverageUncovered` | Colors for the semantic-token route.                              |
+
+After changing any option or setting, restart the language server with
+`editor: restart language server`. Options are only read at startup. After
+changing the Rust extension, run `zed: rebuild dev extension` instead.
+
+### Example: red borders on untested code
 
 ```json
 {
+  "lsp_document_colors": "border",
+  "languages": {
+    "Go": { "language_servers": ["go-coverage", "..."] }
+  },
   "lsp": {
-    "go-coverage": { "initialization_options": { "profile": "out/cover.out" } }
+    "go-coverage": {
+      "initialization_options": {
+        "profile": "coverage.out",
+        "show": "uncovered",
+        "diagnostics": false
+      }
+    }
   }
 }
 ```
+
+Use `"lsp_document_colors": "background"` for a fill, and `"show": "all"` to
+see covered code in green as well. Colors are fixed: translucent green for
+covered and red for uncovered.
+
+### Alternative: semantic tokens
+
+The server also reports coverage as semantic tokens with the custom types
+`coverageCovered` and `coverageUncovered`, which Zed can color with rules you
+choose. Do not combine this with `lsp_document_colors`, or both paint the same
+code.
+
+```json
+{
+  "lsp_document_colors": "none",
+  "languages": {
+    "Go": { "language_servers": ["go-coverage", "..."], "semantic_tokens": "combined" }
+  },
+  "global_lsp_settings": {
+    "semantic_token_rules": [
+      { "token_type": "coverageCovered", "background_color": "#2ea04333" },
+      { "token_type": "coverageUncovered", "background_color": "#f8514933" }
+    ]
+  },
+  "lsp": {
+    "go-coverage": { "initialization_options": { "diagnostics": false } }
+  }
+}
+```
+
+Highlights cover the text of each block, not the full editor width.
 
 ## Development
 
