@@ -1,0 +1,11 @@
+id = "go-coverage"
+name = "Go Coverage"
+version = "0.1.0"
+schema_version = 1
+authors = ["Beni Pranata <beni@pewara.com>"]
+description = "Highlights Go code not covered by tests, from a coverage profile."
+repository = "https://github.com/benipranata/zed-go-coverage"
+
+[language_servers.go-coverage]
+name = "Go Coverage"
+languages = ["Go"]
