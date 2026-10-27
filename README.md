@@ -6,9 +6,11 @@ language server, `go-coverage-lsp`.
 
 ## Setup
 
-1. Install the server: `go install github.com/benipranata/zed-go-coverage/server/cmd/go-coverage-lsp@latest`
-2. Install this repository as a dev extension (`zed: install dev extension`). Building it needs Rust.
-3. Enable the server for Go in your Zed settings:
+1. Install the extension from `zed: extensions` (search for "Go Coverage").
+   It downloads the `go-coverage-lsp` server from this repository's GitHub
+   releases. If `go-coverage-lsp` is already on your `PATH`, that copy is used
+   instead.
+2. Enable the server for Go in your Zed settings:
 
    ```json
    {
@@ -18,7 +20,12 @@ language server, `go-coverage-lsp`.
    }
    ```
 
-4. Generate a profile in the project root: `go test -coverprofile=coverage.out ./...`
+3. Generate a profile in the project root: `go test -coverprofile=coverage.out ./...`
+
+To build from source instead, install the server with
+`go install github.com/benipranata/zed-go-coverage/server/cmd/go-coverage-lsp@latest`
+and install this repository as a dev extension (`zed: install dev extension`).
+Building the extension needs Rust installed through rustup.
 
 Open files update when the profile changes and on save. Edits clear the marks
 until the next save, because the profile no longer matches the buffer. Marks
@@ -104,3 +111,10 @@ Highlights cover the text of each block, not the full editor width.
 ```sh
 cd server && go test ./... -cover
 ```
+
+## Releasing
+
+Push a `vX.Y.Z` tag. The release workflow tests the server, builds archives
+for macOS, Linux and Windows with `scripts/package.sh`, and publishes them as a
+GitHub release. Also tag the Go module as `server/vX.Y.Z` so `go install` can
+resolve a version.

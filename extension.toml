@@ -9,3 +9,8 @@ repository = "https://github.com/benipranata/zed-go-coverage"
 [language_servers.go-coverage]
 name = "Go Coverage"
 languages = ["Go"]
+
+[[capabilities]]
+kind = "download_file"
+host = "github.com"
+path = ["benipranata", "zed-go-coverage", "releases", "download", "*", "*"]

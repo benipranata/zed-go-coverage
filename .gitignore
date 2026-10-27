@@ -1,3 +1,4 @@
 target/
 *.wasm
 coverage.out
+dist/
